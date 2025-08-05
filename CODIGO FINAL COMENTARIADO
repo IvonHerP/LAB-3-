@@ -1,0 +1,144 @@
+//IVON HERNANDEZ
+//231111
+
+#include <Arduino.h>
+#include <stdint.h>
+
+// Pines de los LEDs del contador manual (muestran el valor con LEDs binarios)
+const int ledsManual[4] = {32, 33, 25, 14};
+
+// Pines de los LEDs del contador automático
+const int ledsAuto[4] = {12, 13, 21, 22};
+
+// LED indicador que parpadea cuando los contadores coinciden
+const int LED_INDICADOR = 4;
+
+// Pines para los botones físicos
+const int botonInc = 27;  // Botón para aumentar el contador manual
+const int botonDec = 26;  // Botón para disminuir el contador manual
+
+// --- Sensor capacitivo (botón táctil B3) ---
+const int pinCap = 15;     // Pin del sensor táctil (GPIO15)
+int umbralCap = 30;        // Sensibilidad del sensor (valor más bajo = fue tocado)
+
+// Contadores de cada modo
+volatile int contadorManual = 0;       // Guarda el número que muestra el modo manual
+volatile int contadorAutomatico = 0;   // Guarda el número que aumenta solo
+
+volatile bool indicadorEstado = false; // Estado del LED indicador (encendido o apagado)
+
+// Variables para evitar rebote (botones físicos)
+volatile unsigned long lastPressInc = 0;
+volatile unsigned long lastPressDec = 0;
+
+// Temporizador del ESP32 (para el modo automático)
+hw_timer_t * timer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Función para mostrar un número binario en 4 LEDs
+void mostrar(int valor, const int * leds) {
+  for (int i = 0; i < 4; i++) {
+    bool bitestado = bitRead(valor, i);          // Lee bit por bit (de 0 a 3)
+    digitalWrite(leds[i], bitestado);            // Enciende o apaga el LED según el bit
+  }
+}
+
+// Interrupción cuando se presiona el botón para incrementar
+void IRAM_ATTR incrementar() {
+  unsigned long tiempo = millis();
+  if (tiempo - lastPressInc > 200) {             // Espera 200ms para evitar rebotes
+    contadorManual++;                             // Aumenta el número manual
+    if (contadorManual > 15) contadorManual = 0;  // Si llega a 16, vuelve a 0
+    lastPressInc = tiempo;                        // Guarda el tiempo de la pulsación
+  }
+}
+
+// Interrupción cuando se presiona el botón para decrementar
+void IRAM_ATTR decrementar() {
+  unsigned long tiempo = millis();
+  if (tiempo - lastPressDec > 200) {
+    contadorManual--;                             // Resta 1 al contador manual
+    if (contadorManual < 0) contadorManual = 15;  // Si baja de 0, va a 15
+    lastPressDec = tiempo;
+  }
+}
+
+// Interrupción del temporizador: se llama cada 250ms
+void IRAM_ATTR onTimer() {
+  portENTER_CRITICAL_ISR(&timerMux);              // Evita que otras interrupciones molesten
+
+  contadorAutomatico++;                           // Aumenta el contador automático
+  if (contadorAutomatico > 15) contadorAutomatico = 0;
+
+  // Si ambos contadores tienen el mismo valor
+  if (contadorAutomatico == contadorManual) {
+    indicadorEstado = !indicadorEstado;           // Cambia el estado del LED indicador
+    digitalWrite(LED_INDICADOR, indicadorEstado ? HIGH : LOW);
+    contadorAutomatico = 0;                       // Reinicia el contador automático
+  }
+
+  // Muestra el valor del automático en sus LEDs
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(ledsAuto[i], (contadorAutomatico >> i) & 0x01);
+  }
+
+  portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+// Configuración inicial
+void setup() {
+  Serial.begin(115200);  // Comunicación para depuración por consola
+
+  // Configurar LEDs manuales como salida
+  for (int i = 0; i < 4; i++) {
+    pinMode(ledsManual[i], OUTPUT);
+    digitalWrite(ledsManual[i], LOW);
+  }
+
+  // Configurar LEDs automáticos como salida
+  for (int i = 0; i < 4; i++) {
+    pinMode(ledsAuto[i], OUTPUT);
+    digitalWrite(ledsAuto[i], LOW);
+  }
+
+  // LED indicador como salida
+  pinMode(LED_INDICADOR, OUTPUT);
+  digitalWrite(LED_INDICADOR, LOW);
+
+  // Botones como entradas con resistencia pull-up
+  pinMode(botonInc, INPUT_PULLUP);
+  pinMode(botonDec, INPUT_PULLUP);
+
+  // Interrupciones para detectar cuando los botones se presionan
+  attachInterrupt(digitalPinToInterrupt(botonInc), incrementar, FALLING);
+  attachInterrupt(digitalPinToInterrupt(botonDec), decrementar, FALLING);
+
+  // Configuración del temporizador (cada 250 milisegundos)
+  timer = timerBegin(0, 80, true);                  // Temporizador 0, prescaler 80 -> 1us
+  timerAttachInterrupt(timer, &onTimer, true);      // Conecta la ISR
+  timerAlarmWrite(timer, 250000, true);             // 250000us = 250ms
+  timerAlarmEnable(timer);                          // Activa la alarma
+
+  // Configura el sensor táctil (sólo lectura, no genera interrupción)
+  touchAttachInterrupt(pinCap, NULL, umbralCap);
+}
+
+// Bucle principal (se repite para siempre)
+void loop() {
+  mostrar(contadorManual, ledsManual);  // Mostrar el número manual con sus LEDs
+
+  // Leer sensor capacitivo
+  int lectura = touchRead(pinCap);
+
+  // Si se toca el sensor (lectura baja), reinicia contador automático
+  if (lectura < umbralCap) {
+    portENTER_CRITICAL(&timerMux);        // Proteger acceso al contador
+    contadorAutomatico = 0;
+    portEXIT_CRITICAL(&timerMux);
+
+    Serial.println("B3 TOCADO: contador automático reiniciado");  // Mensaje para depurar
+    delay(300); // Espera para evitar múltiples lecturas por un solo toque
+  }
+
+  delay(50);  // Pequeña pausa para que todo sea más estable
+}
